@@ -20,4 +20,4 @@ RUN apt-get update \
 EXPOSE 8000
 
 # Run the FastAPI app using Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["/bin/bash", "-c", "sleep 10 && uvicorn main:app --host 0.0.0.0 --port 8000"]
