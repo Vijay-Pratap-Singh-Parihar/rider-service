@@ -1,22 +1,125 @@
-version: '3.8'
+version: '3.9'
 
 services:
+# DB SERVICES
   db:
     image: postgres:14.19-alpine3.21
     container_name: pg14
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: rider_db
+      POSTGRES_DB: postgres
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./db_init:/docker-entrypoint-initdb.d/
     networks:
       - app-network
 
+  mongodb-driver:
+    image: mongo:7
+    container_name: mongodb-driver
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    environment:
+      MONGO_INITDB_DATABASE: driver-service
+    volumes:
+      - mongodb_driver_data:/data/db
+    networks:
+      - app-network
+
+  mongodb-notification:
+    image: mongo:7
+    container_name: mongodb-notification
+    restart: unless-stopped
+    ports:
+      - "27019:27017"
+    environment:
+      MONGO_INITDB_DATABASE: notification-service
+    volumes:
+      - mongodb_notification_data:/data/db
+    networks:
+      - app-network
+
+  mongodb-payment:
+    image: mongo:7
+    container_name: mongodb-payment
+    restart: unless-stopped
+    ports:
+      - "27020:27017"
+    environment:
+      MONGO_INITDB_DATABASE: payment-service
+    volumes:
+      - mongodb_payment_data:/data/db
+    networks:
+      - app-network
+  
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+    networks:
+      - app-network
+
+# MAIN SERVICES
+  driver-service:
+    build:
+      context: ./driver-service
+      dockerfile: Dockerfile
+    image: driver-service:latest
+    container_name: driver-service
+    depends_on:
+      mongodb-driver:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      MONGODB_URI: mongodb://mongodb-driver:27017
+      MONGODB_DB_NAME: driver-service
+      DRIVER_COLLECTION: drivers
+      KAFKA_CLIENT_ID: driver-service
+      KAFKA_BROKERS: kafka:9093
+      KAFKA_TOPIC_DRIVER_EVENTS: driver-events
+      KAFKA_TOPIC_DRIVER_NOTIFICATIONS: driver-notifications
+      KAFKA_DRIVER_EVENTS_PARTITIONS: 3
+      KAFKA_DRIVER_NOTIFICATIONS_PARTITIONS: 3
+    networks:
+      - app-network
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
   rider-service:
-    build: .
+    build: ./rider-service
     container_name: rider-service
     ports:
       - "8000:8000"
@@ -26,6 +129,87 @@ services:
       - DATABASE_URL=postgresql://postgres:password@db:5432/rider_db
     networks:
       - app-network
+  trip-service:
+    build: ./trip-service
+    container_name: trip-service
+    ports:
+      - "8002:8002"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/trip_db
+    networks:
+      - app-network
+  rating-service:
+    build: ./feedback-service
+    container_name: feedback-service
+    ports:
+      - "8001:8001"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/rating_db
+    networks:
+      - app-network
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    image: notification-service:latest
+    container_name: notification-service
+    depends_on:
+      mongodb-notification:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3004
+      MONGODB_URI: mongodb://mongodb-notification:27017
+      MONGODB_DB_NAME: notification-service
+      NOTIFICATION_COLLECTION: notifications
+      KAFKA_CLIENT_ID: notification-service
+      KAFKA_BROKERS: kafka:9093
+      KAFKA_GROUP_ID: notification-service-group
+      KAFKA_TOPIC_TRIP_EVENTS: trip-events
+      KAFKA_TOPIC_PAYMENT_EVENTS: payment-events
+      KAFKA_TOPIC_DRIVER_NOTIFICATIONS: driver-notifications
+    networks:
+      - app-network
+    ports:
+      - "3004:3004"
+    restart: unless-stopped
+
+  payment-service:
+    build:
+      context: ./payment-service
+      dockerfile: Dockerfile
+    image: payment-service:latest
+    container_name: payment-service
+    depends_on:
+      mongodb-payment:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3003
+      MONGODB_URI: mongodb://mongodb-payment:27017
+      MONGODB_DB_NAME: payment-service
+      KAFKA_CLIENT_ID: payment-service
+      KAFKA_BROKERS: kafka:9093
+      KAFKA_TOPIC_PAYMENT_EVENTS: payment-events
+      KAFKA_TOPIC_PAYMENT_NOTIFICATIONS: payment-notifications
+      KAFKA_PAYMENT_EVENTS_PARTITIONS: 3
+      KAFKA_PAYMENT_NOTIFICATIONS_PARTITIONS: 3
+      PAYMENT_GATEWAY_NAME: mock-stripe
+      PAYMENT_GATEWAY_FAILURE_RATE: "0"
+    networks:
+      - app-network
+    ports:
+      - "3003:3003"
+    restart: unless-stopped
 
 networks:
   app-network:
@@ -34,3 +218,6 @@ networks:
 volumes:
   pgdata:
     driver: local
+  mongodb_driver_data:
+  mongodb_notification_data:
+  mongodb_payment_data:
